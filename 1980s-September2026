@@ -1,0 +1,265 @@
+python -m pip install pandas numpy matplotlib seaborn requests statsmodels
+
+from io import BytesIO
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. SETTINGS
+# ==========================================
+
+START = "1980-01-01"
+END = "2026-09-01"
+
+# World Bank monthly commodity prices
+GOLD_URL = (
+    "https://thedocs.worldbank.org/en/doc/"
+    "74e8be41ceb20fa0da750cda2f6b9e4e-0050012026/"
+    "related/CMO-Historical-Data-Monthly.xlsx"
+)
+
+# ==========================================
+# 2. DOWNLOAD GOLD DATA
+# ==========================================
+
+response = requests.get(GOLD_URL, timeout=60)
+response.raise_for_status()
+
+gold = pd.read_excel(
+    BytesIO(response.content),
+    sheet_name="Monthly Prices",
+    header=4
+)
+
+# World Bank dates look like 1980M01
+gold = gold.rename(columns={gold.columns[0]: "Date"})
+gold["Date"] = pd.to_datetime(
+    gold["Date"].astype(str).str.strip(),
+    format="%YM%m",
+    errors="coerce"
+)
+
+gold["Gold"] = pd.to_numeric(gold["Gold"], errors="coerce")
+
+gold = (
+    gold[["Date", "Gold"]]
+    .dropna()
+    .set_index("Date")
+    .sort_index()
+)
+
+# ==========================================
+# 3. DOWNLOAD FEDERAL RESERVE DATA
+# ==========================================
+
+def fred_series(series_id):
+    url = (
+        "https://fred.stlouisfed.org/graph/"
+        f"fredgraph.csv?id={series_id}"
+    )
+
+    df = pd.read_csv(url)
+    df.columns = ["Date", series_id]
+    df["Date"] = pd.to_datetime(df["Date"])
+    df[series_id] = pd.to_numeric(
+        df[series_id], errors="coerce"
+    )
+
+    return df.set_index("Date")[[series_id]]
+
+
+# CPI: inflation measurement
+cpi = fred_series("CPIAUCSL")
+cpi = cpi.rename(columns={"CPIAUCSL": "CPI"})
+
+# Broad USD index, available from 2006
+usd = fred_series("TWEXBGSMTH")
+usd = usd.rename(columns={"TWEXBGSMTH": "USD_Index"})
+
+# Convert dates to monthly timestamps
+for df in (gold, cpi, usd):
+    df.index = df.index.to_period("M").to_timestamp()
+
+# ==========================================
+# 4. COMBINE DATA
+# ==========================================
+
+data = gold.join(cpi, how="outer")
+data = data.join(usd, how="left")
+
+data = data.loc[START:END].sort_index()
+
+# Require gold and CPI for purchasing power analysis
+data = data.dropna(subset=["Gold", "CPI"])
+
+# ==========================================
+# 5. CALCULATE FINANCIAL METRICS
+# ==========================================
+
+# Gold price expressed in September 2026 dollars
+latest_cpi = data["CPI"].iloc[-1]
+
+data["Real_Gold"] = (
+    data["Gold"] * latest_cpi / data["CPI"]
+)
+
+# Ounces of gold that one dollar can buy
+data["Gold_Per_Dollar"] = 1 / data["Gold"]
+
+# CPI purchasing power relative to January 1980
+data["Dollar_Purchasing_Power"] = (
+    100 * data["CPI"].iloc[0] / data["CPI"]
+)
+
+# Gold index, January 1980 = 100
+data["Gold_Indexed"] = (
+    100 * data["Gold"] / data["Gold"].iloc[0]
+)
+
+# Inflation-adjusted gold index
+data["Real_Gold_Indexed"] = (
+    100 * data["Real_Gold"] / data["Real_Gold"].iloc[0]
+)
+
+# Monthly percentage returns
+data["Gold_Return"] = data["Gold"].pct_change(
+    fill_method=None
+)
+
+data["USD_Return"] = data["USD_Index"].pct_change(
+    fill_method=None
+)
+
+# ==========================================
+# 6. CHART 1: GOLD PRICE SINCE 1980
+# ==========================================
+
+plt.figure(figsize=(12, 6))
+
+plt.plot(
+    data.index, data["Gold"],
+    label="Nominal Gold Price"
+)
+
+plt.plot(
+    data.index, data["Real_Gold"],
+    label="Gold Price in Sep 2026 Dollars"
+)
+
+plt.title("Gold Prices: 1980 to September 2026")
+plt.xlabel("Year")
+plt.ylabel("USD per Troy Ounce")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("gold_prices.png", dpi=200)
+plt.show()
+
+# ==========================================
+# 7. CHART 2: PURCHASING POWER
+# ==========================================
+
+plt.figure(figsize=(12, 6))
+
+plt.plot(
+    data.index,
+    data["Dollar_Purchasing_Power"],
+    label="Dollar Purchasing Power"
+)
+
+plt.plot(
+    data.index,
+    data["Real_Gold_Indexed"],
+    label="Inflation-Adjusted Gold Value"
+)
+
+plt.title("Dollar Purchasing Power vs Gold")
+plt.xlabel("Year")
+plt.ylabel("Index: January 1980 = 100")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("purchasing_power.png", dpi=200)
+plt.show()
+
+# ==========================================
+# 8. CHART 3: GOLD VS USD INDEX
+# ==========================================
+
+# Both series are available together from 2006
+comparison = data[["Gold", "USD_Index"]].dropna()
+
+comparison = (
+    comparison / comparison.iloc[0] * 100
+)
+
+plt.figure(figsize=(12, 6))
+
+plt.plot(
+    comparison.index,
+    comparison["Gold"],
+    label="Gold"
+)
+
+plt.plot(
+    comparison.index,
+    comparison["USD_Index"],
+    label="USD Index"
+)
+
+plt.title("Gold vs US Dollar: Common Base = 100")
+plt.xlabel("Year")
+plt.ylabel("Indexed Value")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("gold_vs_usd.png", dpi=200)
+plt.show()
+
+# ==========================================
+# 9. CORRELATION AND REGRESSION
+# ==========================================
+
+returns = data[
+    ["Gold_Return", "USD_Return"]
+].dropna()
+
+correlation = returns["Gold_Return"].corr(
+    returns["USD_Return"]
+)
+
+# Estimate gold return = alpha + beta * USD return
+beta, alpha = np.polyfit(
+    returns["USD_Return"],
+    returns["Gold_Return"],
+    1
+)
+
+print("\nFINANCIAL MODEL RESULTS")
+print("=" * 40)
+
+print(f"Start: {data.index.min().date()}")
+print(f"End: {data.index.max().date()}")
+
+print(f"\nGold/USD correlation: {correlation:.3f}")
+print(f"Regression alpha: {alpha:.4f}")
+print(f"Regression beta: {beta:.4f}")
+
+print(
+    "\nEstimated gold return = "
+    f"{alpha:.4f} + ({beta:.4f} x USD return)"
+)
+
+# ==========================================
+# 10. EXPORT RESULTS
+# ==========================================
+
+data.to_csv("gold_usd_model.csv")
+
+print("\nSaved:")
+print("gold_prices.png")
+print("purchasing_power.png")
+print("gold_vs_usd.png")
+print("gold_usd_model.csv")
